@@ -1,0 +1,99 @@
+name: Test, publish and deploy
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/danil-nikolaev/audit-svc
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: poetry.lock
+      - name: Install Poetry and project
+        run: |
+          python -m pip install poetry==1.8.5 poetry-plugin-export==1.8.0
+          poetry install
+      - name: Run tests with JUnit report
+        run: poetry run pytest --junitxml=python.junit.xml
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-junit-${{ github.sha }}
+          path: python.junit.xml
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Select image tag
+        id: image
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid release tag: $tag" >&2; exit 1; }
+          else
+            tag="main_${GITHUB_SHA::8}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ref=${IMAGE}:$tag" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish ARM64 image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/arm64
+          build-args: SOURCE_DATE_EPOCH=315532800
+          push: true
+          tags: ${{ steps.image.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+
+  deploy:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: publish
+    runs-on: [self-hosted, linux, ARM64, deploy]
+    environment:
+      name: production
+      url: http://172.16.49.128:8088
+    steps:
+      - uses: actions/checkout@v6
+      - name: Log in to GHCR
+        run: echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install required Ansible collections
+        run: ansible-galaxy collection install -r deploy/requirements.yml
+      - name: Deploy release with Ansible
+        working-directory: deploy
+        run: >-
+          ansible-playbook audit-svc.play.yml
+          --vault-password-file vault-pass.sh
+          -e audit_svc_image=${{ needs.publish.outputs.image }}
+        env:
+          ANSIBLE_VAULT_PASSWORD: ${{ secrets.ANSIBLE_VAULT_PASSWORD }}
