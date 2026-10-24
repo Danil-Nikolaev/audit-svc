@@ -1,0 +1,16 @@
+audit_network: audit-net
+audit_data_dir: /data/audit-svc
+audit_config_dir: /data/audit-svc/config
+audit_nginx_dir: /data/audit-svc/nginx
+audit_svc_image: ''
+audit_svc_pull: always
+audit_svc_uid: 10001
+audit_svc_gid: 10001
+postgres_image: postgres:17
+postgres_database: audit
+postgres_user: audit_svc
+nginx_image: nginx:1.28-alpine
+nginx_exporter_image: nginx/nginx-prometheus-exporter:1.4
+
+postgres_superuser_password: "{{ vault_postgres_superuser_password }}"
+audit_database_password: "{{ vault_audit_database_password }}"
