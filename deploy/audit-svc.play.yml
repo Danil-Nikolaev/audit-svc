@@ -1,0 +1,185 @@
+---
+- name: Deploy audit service
+  hosts: audit
+  gather_facts: false
+  become: true
+
+  pre_tasks:
+    - name: Validate release image
+      ansible.builtin.assert:
+        that:
+          - audit_svc_image | length > 0
+          - audit_svc_image is match('^ghcr\.io/danil-nikolaev/audit-svc:v[0-9]+\.[0-9]+\.[0-9]+$')
+        fail_msg: A release image tagged vX.Y.Z is required
+
+    - name: Install PostgreSQL Python adapter
+      ansible.builtin.apt:
+        name: python3-psycopg2
+        state: present
+        update_cache: false
+
+  tasks:
+    - name: Create host group matching the container group
+      ansible.builtin.group:
+        name: audit-svc
+        gid: "{{ audit_svc_gid }}"
+        system: true
+
+    - name: Create deployment directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: root
+        group: "{{ item.group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - {path: "{{ audit_data_dir }}", group: root, mode: '0755'}
+        - {path: "{{ audit_config_dir }}", group: audit-svc, mode: '0750'}
+        - {path: "{{ audit_nginx_dir }}", group: root, mode: '0755'}
+
+    - name: Create deployment network
+      community.docker.docker_network:
+        name: "{{ audit_network }}"
+        internal: false
+        state: present
+
+    - name: Create PostgreSQL data volume
+      community.docker.docker_volume:
+        name: audit-postgres-data
+        state: present
+
+    - name: Run PostgreSQL
+      community.docker.docker_container:
+        name: audit-postgres
+        image: "{{ postgres_image }}"
+        pull: missing
+        state: healthy
+        restart_policy: unless-stopped
+        env:
+          POSTGRES_PASSWORD: "{{ postgres_superuser_password }}"
+          POSTGRES_DB: postgres
+        volumes:
+          - audit-postgres-data:/var/lib/postgresql/data
+        networks:
+          - name: "{{ audit_network }}"
+            aliases: [postgres]
+        healthcheck:
+          test: [CMD-SHELL, 'pg_isready -U postgres -d postgres']
+          interval: 5s
+          timeout: 3s
+          retries: 20
+        comparisons:
+          networks: strict
+      no_log: true
+
+    - name: Read PostgreSQL container facts
+      community.docker.docker_container_info:
+        name: audit-postgres
+      register: postgres_container
+
+    - name: Create application database user
+      community.postgresql.postgresql_user:
+        login_host: "{{ postgres_container.container.NetworkSettings.Networks[audit_network].IPAddress }}"
+        login_user: postgres
+        login_password: "{{ postgres_superuser_password }}"
+        login_db: postgres
+        name: "{{ postgres_user }}"
+        password: "{{ audit_database_password }}"
+        role_attr_flags: LOGIN,NOSUPERUSER,NOCREATEDB,NOCREATEROLE
+        state: present
+      environment:
+        PGOPTIONS: -c password_encryption=scram-sha-256
+      no_log: true
+
+    - name: Create application database owned by application user
+      community.postgresql.postgresql_db:
+        login_host: "{{ postgres_container.container.NetworkSettings.Networks[audit_network].IPAddress }}"
+        login_user: postgres
+        login_password: "{{ postgres_superuser_password }}"
+        name: "{{ postgres_database }}"
+        owner: "{{ postgres_user }}"
+        state: present
+      no_log: true
+
+    - name: Render application configuration
+      ansible.builtin.template:
+        src: config.yaml.j2
+        dest: "{{ audit_config_dir }}/config.yaml"
+        owner: root
+        group: audit-svc
+        mode: '0640'
+      notify: Reload audit service configuration
+      no_log: true
+
+    - name: Run audit service release
+      community.docker.docker_container:
+        name: audit-svc
+        image: "{{ audit_svc_image }}"
+        pull: "{{ audit_svc_pull }}"
+        image_name_mismatch: ignore
+        state: healthy
+        restart_policy: unless-stopped
+        command: server
+        volumes:
+          - "{{ audit_config_dir }}:/etc/audit-svc:ro"
+        networks:
+          - name: "{{ audit_network }}"
+            aliases: [audit-svc]
+        comparisons:
+          networks: strict
+
+    - name: Render Nginx configuration
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: "{{ audit_nginx_dir }}/nginx.conf"
+        owner: root
+        group: root
+        mode: '0644'
+      notify: Reload Nginx
+
+    - name: Run Nginx reverse proxy
+      community.docker.docker_container:
+        name: audit-nginx
+        image: "{{ nginx_image }}"
+        pull: missing
+        state: started
+        restart_policy: unless-stopped
+        volumes:
+          - "{{ audit_nginx_dir }}/nginx.conf:/etc/nginx/nginx.conf:ro"
+        ports:
+          - 0.0.0.0:8088:8080
+        networks:
+          - name: "{{ audit_network }}"
+            aliases: [nginx]
+        comparisons:
+          networks: strict
+
+    - name: Run Nginx Prometheus exporter
+      community.docker.docker_container:
+        name: audit-nginx-exporter
+        image: "{{ nginx_exporter_image }}"
+        pull: missing
+        state: started
+        restart_policy: unless-stopped
+        command:
+          - --nginx.scrape-uri=http://nginx:8081/stub_status
+        ports:
+          - 0.0.0.0:9113:9113
+        networks:
+          - name: "{{ audit_network }}"
+            aliases: [nginx-exporter]
+        comparisons:
+          networks: strict
+
+  handlers:
+    - name: Reload audit service configuration
+      community.docker.docker_container_exec:
+        container: audit-nginx
+        command: wget -qO- --post-data= http://audit-svc:8080/reload
+      changed_when: true
+
+    - name: Reload Nginx
+      community.docker.docker_container_exec:
+        container: audit-nginx
+        command: nginx -s reload
+      changed_when: true
