@@ -27,11 +27,27 @@ tests/test_main.py ......                                              [100%]
 
 ### Пайплайн main
 
-Скриншот графа пайплайна и публикации образа будет добавлен после первого запуска.
+Run: <https://github.com/Danil-Nikolaev/audit-svc/actions/runs/40123702432>. Jobs `test` и `publish` успешны, `deploy` пропущен (только для тегов). JUnit-отчёт загружен как artifact `python-junit-<sha>`, образ опубликован как `ghcr.io/danil-nikolaev/audit-svc:main_<sha8>`.
+
+![main pipeline](screenshots/01-main-pipeline.png)
+
+Лог задачи `publish`, загрузка образа в GHCR:
+
+![publish log](screenshots/01b-publish-log.png)
+
+![GHCR package](screenshots/02-ghcr.png)
+
+Сборка воспроизводимая: все теги на скриншоте (`main_<sha8>` после каждого push в `main`, релизы `v1.0.0` и `v1.0.1`) собраны из одного кода сервиса и указывают на одну версию образа с одним digest.
 
 ### Пайплайн защищённого тега
 
-Скриншот графа релизного пайплайна и полный лог deploy-задачи будут добавлены после релиза `v1.0.0`.
+Теги `v*` защищены ruleset-правилом. Релиз `v1.0.0`: <https://github.com/Danil-Nikolaev/audit-svc/actions/runs/40124204187>. Все три job успешны, `deploy` выполнен на self-hosted runner `devops-vm` (labels `self-hosted, Linux, ARM64, deploy`) в environment `production`.
+
+![release pipeline](screenshots/03-release-pipeline.png)
+
+![deploy log](screenshots/04-deploy-log.png)
+
+PLAY RECAP первого релиза: `ok=15 changed=1`. Изменилась только задача `Run audit service release`: контейнер переключён на образ, собранный в CI, а БД, пользователь и конфиг уже были созданы проверочным прогоном перед публикацией.
 
 ## 2. PostgreSQL и секреты
 
@@ -61,21 +77,43 @@ PLAY RECAP *********************************************************************
 localhost : ok=15 changed=0 unreachable=0 failed=0 skipped=0 rescued=0 ignored=0
 ```
 
-После релиза сюда также будет добавлена ссылка на полный CI-лог.
+Полный CI-лог первого релизного deploy: <https://github.com/Danil-Nikolaev/audit-svc/actions/runs/40124204187>. Контейнер `audit-svc` пересоздан из образа CI `v1.0.0` и стал healthy. Повторный запуск задачи `deploy` в CI (Re-run jobs релиза `v1.0.1`, attempt 2: <https://github.com/Danil-Nikolaev/audit-svc/actions/runs/40124466801/attempts/2>), образ и конфигурация не менялись. PLAY RECAP: `ok=15 changed=0`, handler не вызывался:
+
+![deploy re-run](screenshots/04b-deploy-rerun.png)
+
+Тот же playbook, запущенный на целевой машине с тем же образом:
+
+```text
+PLAY RECAP *********************************************************************
+localhost                  : ok=15   changed=0    unreachable=0    failed=0    skipped=0    rescued=0    ignored=0
+```
+
+`StartedAt` до и после повторного запуска одинаковый: `2026-10-24T19:13:19.948894225Z`.
 
 ### Смена пароля
 
-Будут зафиксированы:
+Новый пароль `audit_svc` сгенерирован (`openssl rand -hex 24`) и записан в зашифрованный `vault.yml`. Коммит `Rotate audit_svc database password`, релиз `v1.0.1`: <https://github.com/Danil-Nikolaev/audit-svc/actions/runs/40124466801>.
 
-1. `StartedAt` до смены пароля;
-2. задачи обновления пользователя, шаблона и reload handler со статусом `changed`;
-3. неизменившийся `StartedAt`;
-4. сообщение `config reloaded, reconnected to the database`;
-5. увеличение `audit_config_reloads_total{result="success"}` и ответ `/healthz` 200.
+Образ `v1.0.1` собран из того же кода и имеет тот же digest. Задачи `Create application database user` и `Render application configuration` получили статус `changed`, после чего сработал handler `Reload audit service configuration` (`POST /reload`). PLAY RECAP: `ok=16 changed=4`. Задача `Run audit service release` тоже `changed`: тег `v1.0.1` впервые скачивается из GHCR (`pull: always`). Но digest тот же, а `image_name_mismatch: ignore` не даёт пересоздать контейнер из-за одного лишь имени тега. Поэтому контейнер не пересоздан, и `StartedAt` не изменился (см. таблицу).
+
+![rotation deploy log](screenshots/05-rotation-log.png)
+
+| Проверка | До `v1.0.1` | После `v1.0.1` |
+|---|---|---|
+| `StartedAt` | `2026-10-24T19:13:19.948894225Z` | `2026-10-24T19:13:19.948894225Z` |
+| image | `sha256:8d557ef606e9…` | `sha256:8d557ef606e9…` |
+| `audit_config_reloads_total{result="success"}` | 0 | 1 |
+| `/healthz` | 200 | 200 |
+
+Лог сервиса:
+
+```text
+2026-10-24 19:16:40,081 [INFO] audit_svc.main: config reloaded, reconnected to the database
+```
 
 ## 4. Nginx и nginx-exporter
 
-Проверки после первого релиза:
+Проверки после релизов `v1.0.0`/`v1.0.1`:
 
 ```bash
 curl -s localhost:8088/healthz
@@ -120,9 +158,21 @@ audit-svc  up
 nginx      up
 ```
 
-После запуска будут добавлены скриншоты:
+Нагрузка 10 минут:
 
-- обе цели Prometheus в состоянии `UP`;
-- dashboard audit-svc после десятиминутной нагрузки;
-- официальный dashboard Nginx;
-- панель сервиса в состояниях `UP` и `DOWN`.
+```bash
+docker run --rm --name audit-load --network audit-net \
+  ghcr.io/danil-nikolaev/audit-svc:v1.0.1 generate --url http://nginx:8080 --rate 20 --duration 600
+```
+
+![Prometheus targets](screenshots/06-prometheus-targets.png)
+
+![audit-svc dashboard](screenshots/07-grafana-audit-svc.png)
+
+![nginx dashboard](screenshots/08-grafana-nginx.png)
+
+Состояние сервиса: `UP`, затем `DOWN` после `docker stop audit-svc`, после `docker start audit-svc` снова `UP`.
+
+![UP](screenshots/09-status-up.png)
+
+![DOWN](screenshots/10-status-down.png)
