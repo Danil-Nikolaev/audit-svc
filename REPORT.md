@@ -1,9 +1,5 @@
 # Итоговая работа: развёртывание и мониторинг audit-svc
 
-Репозиторий: <https://github.com/Danil-Nikolaev/audit-svc>
-
-Платформа: GitHub Actions, GitHub Container Registry и self-hosted ARM64 runner на Ubuntu 24.04.
-
 ## 1. Сборка и публикация образа
 
 Образ собирается многоступенчатым `Dockerfile`. Финальный процесс работает от пользователя `audit-svc` с UID/GID 10001. В образ установлены команды `server`, `migrate` и `generate`.
